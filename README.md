@@ -10,7 +10,7 @@ Ask questions naturally and receive accurate, AI-generated answers with real-tim
 
 
 ```bash
-https://github.com/codertheashish/LangSearch-Chatbot.git
+https://codertheashish.github.io/LangSearch-Chatbot/
 ```
 
 ---
@@ -77,7 +77,7 @@ https://github.com/codertheashish/LangSearch-Chatbot.git
 ### Go to Project Folder
 
 ```bash
-cd LangSearch-AI
+cd LangSearch-Chatbot
 ```
 
 ### Create Virtual Environment
@@ -168,11 +168,6 @@ Contributions, issues, and feature requests are welcome.
 
 Feel free to fork this repository and submit a pull request.
 
----
-
-## 📄 License
-
-This project is licensed under the MIT License.
 
 ---
 
@@ -180,9 +175,9 @@ This project is licensed under the MIT License.
 
 **Ashish Kumar Prajapati**
 
-- GitHub:<br> 
-https://github.com/codertheashish<br>
-- LinkedIn: <br>
-https://www.linkedin.com/in/codertheashish
+- GitHub:
+[codertheashish](https://github.com/codertheashish)
+- Linkedin :
+[codertheashish](https://www.linkedin.com/in/codertheashish/)
 
 ⭐ If you found this project useful, don't forget to star the repository!
