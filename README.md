@@ -1,4 +1,3 @@
-# LangSearch-AI 
 # 🔍 LangSearch AI
 
 An AI-powered search assistant that combines the intelligence of Large Language Models with trusted knowledge sources like **Wikipedia** and **ArXiv**.
