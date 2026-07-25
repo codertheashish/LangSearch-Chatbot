@@ -10,7 +10,7 @@ Ask questions naturally and receive accurate, AI-generated answers with real-tim
 
 
 ```bash
-https://codertheashish.github.io/LangSearch-Chatbot/
+https://codertheashish-langsearch-chatbot.streamlit.app/
 ```
 
 ---
