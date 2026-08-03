@@ -175,9 +175,12 @@ Feel free to fork this repository and submit a pull request.
 
 **Ashish Kumar Prajapati**
 
-- GitHub:
+- GitHub :
 [codertheashish](https://github.com/codertheashish)
-- Linkedin :
+- LinkedIn :
 [codertheashish](https://www.linkedin.com/in/codertheashish/)
+- Instagram :
+[codertheashish](https://www.instagram.com/codertheashish/)
+---
 
-⭐ If you found this project useful, don't forget to star the repository!
+⭐ If you like this portfolio, don't forget to give it a star on GitHub.
