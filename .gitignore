@@ -1,5 +1,7 @@
 myenv/
 .env
+.env.*
+!.env.example
 __pycache__/
 *.pyc
 .vscode/

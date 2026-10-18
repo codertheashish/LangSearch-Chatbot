@@ -23,7 +23,7 @@ https://your-project-name.vercel.app
 - ⚡ Fast Responses with Groq LLM
 - 🧠 Tool-Calling Agent Loop (Wikipedia + ArXiv)
 - 📝 Chat History Support
-- 🔐 Secure API Key Input
+- 🔐 API Key Kept Server-Side (never exposed to the browser)
 - 🎨 Clean & Responsive UI (Light / Dark mode)
 - ☁️ One-Click Deploy on Vercel
 - 💻 Easy to Run Locally
@@ -45,7 +45,7 @@ https://your-project-name.vercel.app
 | Python | Backend Logic |
 | Flask | Serverless API (`/api/chat`) |
 | HTML / CSS / JavaScript | Chat Interface |
-| Groq API (Llama 3.3 70B) | Large Language Model |
+| Groq API (GPT-OSS 120B) | Large Language Model |
 | Wikipedia API | Knowledge Retrieval |
 | ArXiv API | Research Paper Search |
 | Vercel | Hosting & Deployment |
@@ -89,7 +89,7 @@ cd LangSearch-Chatbot
 npm i -g vercel
 ```
 
-### Add Groq API Key (Optional)
+### Add Groq API Key
 
 Create a **.env** file and add:
 
@@ -97,7 +97,7 @@ Create a **.env** file and add:
 GROQ_API_KEY=your_groq_api_key
 ```
 
-> You can also skip this and enter the key from the **Settings** button in the app.
+> The key is read only on the server. Optionally set `GROQ_MODEL` to override the default model (`openai/gpt-oss-120b`).
 
 ### Run Application
 
@@ -114,7 +114,7 @@ Open `http://localhost:3000` in your browser.
 1. Push this project to GitHub.
 2. Go to [vercel.com](https://vercel.com) → **Add New** → **Project**.
 3. Import your repository and click **Deploy** (no build settings needed).
-4. *(Optional)* Add `GROQ_API_KEY` in **Project Settings → Environment Variables** so users don't have to enter their own key.
+4. **Required:** add `GROQ_API_KEY` in **Project Settings → Environment Variables** (Production), then **Redeploy** — env changes only apply to new deployments.
 
 ---
 

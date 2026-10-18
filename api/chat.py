@@ -1,16 +1,30 @@
 import json
+import logging
 import os
+import time
 import xml.etree.ElementTree as ET
 from urllib.parse import quote
 
 import requests
 from flask import Flask, jsonify, request
+from werkzeug.exceptions import HTTPException
 
 app = Flask(__name__)
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("langsearch")
 
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-MODEL = "llama-3.3-70b-versatile"
+# Current production model per https://console.groq.com/docs/models.
+# llama-3.3-70b-versatile was retired for free/developer tiers on 2026-08-16.
+# Override without code changes via the GROQ_MODEL environment variable.
+DEFAULT_MODEL = "openai/gpt-oss-120b"
+
 HEADERS = {"User-Agent": "LangSearchChatbot/1.0 (vercel deployment)"}
+
+MAX_HISTORY = 12            # messages kept from the browser
+MAX_MESSAGE_CHARS = 4000    # per message
+MAX_TOOL_ROUNDS = 4         # Wikipedia/ArXiv rounds before forcing an answer
+TIME_BUDGET_SECONDS = 50    # must stay below maxDuration (60s) in vercel.json
 
 SYSTEM_PROMPT = (
     "You are LangSearch, a helpful assistant that can search Wikipedia and "
@@ -29,6 +43,7 @@ def wikipedia_search(query: str) -> str:
                     "format": "json", "srlimit": 1},
             headers=HEADERS, timeout=8,
         )
+        r.raise_for_status()
         hits = r.json().get("query", {}).get("search", [])
         if not hits:
             return "No Wikipedia results found."
@@ -37,10 +52,12 @@ def wikipedia_search(query: str) -> str:
             "https://en.wikipedia.org/api/rest_v1/page/summary/" + quote(title.replace(" ", "_")),
             headers=HEADERS, timeout=8,
         )
+        s.raise_for_status()
         extract = s.json().get("extract", "")
         return f"Page: {title}\nSummary: {extract[:1000]}"
     except Exception as e:
-        return f"Wikipedia search failed: {e}. Try rephrasing the query."
+        log.warning("Wikipedia tool failed: %s", type(e).__name__)
+        return f"Wikipedia search failed: {type(e).__name__}. Try rephrasing the query."
 
 
 def arxiv_search(query: str) -> str:
@@ -63,7 +80,8 @@ def arxiv_search(query: str) -> str:
             out.append(f"Title: {title}\nLink: {link}\nSummary: {summary}")
         return "\n\n".join(out)
     except Exception as e:
-        return f"ArXiv is unavailable right now (possibly rate-limited): {e}"
+        log.warning("ArXiv tool failed: %s", type(e).__name__)
+        return f"ArXiv is unavailable right now (possibly rate-limited): {type(e).__name__}"
 
 
 TOOL_FUNCS = {"wikipedia": wikipedia_search, "arxiv": arxiv_search}
@@ -86,62 +104,165 @@ TOOLS = [
 
 # ---------------- Groq call ----------------
 
-def groq(api_key, messages, use_tools=True):
-    body = {"model": MODEL, "messages": messages, "temperature": 0.3}
+class GroqError(Exception):
+    """Upstream (Groq) failure. `detail` is for server logs only."""
+
+    def __init__(self, status, detail, code=None):
+        super().__init__(detail)
+        self.status = status
+        self.detail = detail
+        self.code = code
+
+
+def groq_chat(api_key, model, messages, use_tools, timeout):
+    body = {"model": model, "messages": messages, "temperature": 0.3}
     if use_tools:
         body["tools"] = TOOLS
         body["tool_choice"] = "auto"
-    r = requests.post(
-        GROQ_URL,
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        json=body, timeout=40,
-    )
+    try:
+        r = requests.post(
+            GROQ_URL,
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json=body, timeout=timeout,
+        )
+    except requests.Timeout:
+        raise GroqError(504, "Groq request timed out")
+    except requests.RequestException as e:
+        raise GroqError(502, f"Could not reach Groq: {type(e).__name__}")
+
     if r.status_code != 200:
+        detail, code = r.text[:500], None
         try:
-            detail = r.json().get("error", {}).get("message", r.text)
+            err = r.json().get("error", {})
+            detail = err.get("message", detail)
+            code = err.get("code")
         except Exception:
-            detail = r.text
-        raise RuntimeError(f"Groq API error ({r.status_code}): {detail}")
-    return r.json()["choices"][0]["message"]
-
-
-# ---------------- Route ----------------
-
-@app.route("/api/chat", methods=["POST"])
-def chat():
-    data = request.get_json(silent=True) or {}
-    api_key = (data.get("api_key") or os.environ.get("GROQ_API_KEY") or "").strip()
-    history = data.get("messages") or []
-
-    if not api_key:
-        return jsonify(error="Add your Groq API key in Settings."), 400
-    if not history:
-        return jsonify(error="No message received."), 400
-
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    for m in history[-12:]:
-        if m.get("role") in ("user", "assistant") and m.get("content"):
-            messages.append({"role": m["role"], "content": str(m["content"])})
+            pass
+        raise GroqError(r.status_code, str(detail).replace(api_key, "[redacted]"), code)
 
     try:
-        for _ in range(4):
-            msg = groq(api_key, messages)
+        message = r.json()["choices"][0]["message"]
+        if not isinstance(message, dict):
+            raise TypeError("message is not an object")
+    except (ValueError, KeyError, IndexError, TypeError) as e:
+        raise GroqError(502, f"Unexpected response format from Groq: {type(e).__name__}")
+    return message
+
+
+def public_message(err: GroqError):
+    """Map an upstream error to (safe text for the browser, HTTP status)."""
+    if err.status in (401, 403):
+        return "The AI service rejected this server's credentials. The site owner needs to check the API key.", 502
+    if err.status == 404:
+        return "The AI model is currently unavailable. The site owner needs to update the model setting.", 502
+    if err.status == 429:
+        return "Too many requests right now. Please wait a moment and try again.", 429
+    if err.status == 504:
+        return "The AI service took too long to respond. Please try again.", 504
+    return "The AI service is temporarily unavailable. Please try again shortly.", 502
+
+
+# ---------------- Routes ----------------
+
+def _config():
+    api_key = os.environ.get("GROQ_API_KEY", "").strip()
+    model = os.environ.get("GROQ_MODEL", "").strip() or DEFAULT_MODEL
+    return api_key, model
+
+
+def _clean_history(raw):
+    if not isinstance(raw, list):
+        return None
+    cleaned = []
+    for m in raw[-MAX_HISTORY:]:
+        if not isinstance(m, dict):
+            continue
+        role, content = m.get("role"), m.get("content")
+        if role in ("user", "assistant") and isinstance(content, str) and content.strip():
+            cleaned.append({"role": role, "content": content[:MAX_MESSAGE_CHARS]})
+    if not cleaned or cleaned[-1]["role"] != "user":
+        return None
+    return cleaned
+
+
+@app.route("/api/chat", methods=["GET", "POST"])
+def chat():
+    api_key, model = _config()
+
+    if request.method == "GET":  # health check: never reveals the key
+        return jsonify(status="ok", configured=bool(api_key), model=model)
+
+    if not api_key:
+        log.error("GROQ_API_KEY is not set in the server environment")
+        return jsonify(error="The chatbot is not configured yet. Please try again later."), 503
+
+    data = request.get_json(silent=True)
+    history = _clean_history(data.get("messages") if isinstance(data, dict) else None)
+    if history is None:
+        return jsonify(error="Please send a message and try again."), 400
+
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history
+    deadline = time.monotonic() + TIME_BUDGET_SECONDS
+    tools_enabled, tool_rounds = True, 0
+
+    try:
+        for _ in range(MAX_TOOL_ROUNDS + 2):
+            remaining = deadline - time.monotonic()
+            if remaining < 5:
+                raise GroqError(504, "Time budget exhausted")
+
+            use_tools = tools_enabled and tool_rounds < MAX_TOOL_ROUNDS
+            try:
+                msg = groq_chat(api_key, model, messages, use_tools, timeout=min(30, remaining))
+            except GroqError as e:
+                if e.status == 400 and e.code == "tool_use_failed" and tools_enabled:
+                    log.warning("Model produced an invalid tool call; retrying without tools")
+                    tools_enabled = False
+                    continue
+                raise
+
             calls = msg.get("tool_calls")
             if not calls:
-                return jsonify(reply=msg.get("content") or "")
+                reply = (msg.get("content") or "").strip()
+                if not reply:
+                    raise GroqError(502, "Model returned an empty answer")
+                return jsonify(reply=reply)
+
+            tool_rounds += 1
             messages.append({"role": "assistant", "content": msg.get("content") or "",
                              "tool_calls": calls})
             for c in calls:
-                name = c["function"]["name"]
+                fn_info = c.get("function") or {}
+                name = str(fn_info.get("name", "")).split(".")[-1]
                 try:
-                    args = json.loads(c["function"]["arguments"] or "{}")
-                except json.JSONDecodeError:
+                    args = json.loads(fn_info.get("arguments") or "{}")
+                except (json.JSONDecodeError, TypeError):
                     args = {}
+                query = str(args.get("query", ""))[:300] if isinstance(args, dict) else ""
                 fn = TOOL_FUNCS.get(name)
-                result = fn(args.get("query", "")) if fn else "Unknown tool."
-                messages.append({"role": "tool", "tool_call_id": c["id"], "content": result})
-        # Out of iterations: force a final answer without tools
-        final = groq(api_key, messages, use_tools=False)
-        return jsonify(reply=final.get("content") or "")
-    except Exception as e:
-        return jsonify(error=str(e)), 502
+                result = fn(query) if fn and query else "Unknown tool or empty query."
+                messages.append({"role": "tool", "tool_call_id": c.get("id", ""), "content": result})
+
+        raise GroqError(502, "No final answer after tool rounds")
+
+    except GroqError as e:
+        log.error("Groq failure: status=%s code=%s model=%s detail=%s", e.status, e.code, model, e.detail)
+        text, status = public_message(e)
+        return jsonify(error=text), status
+
+
+@app.errorhandler(HTTPException)
+def http_error(e):
+    return jsonify(error=e.description or "Request failed."), e.code
+
+
+@app.errorhandler(Exception)
+def unexpected_error(e):
+    log.exception("Unhandled error in /api/chat")
+    return jsonify(error="Something went wrong on the server. Please try again."), 500
+
+
+@app.after_request
+def no_store(resp):
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
