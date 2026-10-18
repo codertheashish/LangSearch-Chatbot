@@ -1,3 +1,2 @@
-
 [tool.vercel]
-entrypoint = "api/chat.py"
+entrypoint = "api.chat:app"
