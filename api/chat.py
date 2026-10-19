@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 import time
 import xml.etree.ElementTree as ET
 from urllib.parse import quote
@@ -24,13 +25,31 @@ HEADERS = {"User-Agent": "LangSearchChatbot/1.0 (vercel deployment)"}
 MAX_HISTORY = 12            # messages kept from the browser
 MAX_MESSAGE_CHARS = 4000    # per message
 MAX_TOOL_ROUNDS = 4         # Wikipedia/ArXiv rounds before forcing an answer
+MAX_TOOL_RETRIES = 2        # retries when the model emits a broken tool call
 TIME_BUDGET_SECONDS = 50    # must stay below maxDuration (60s) in vercel.json
 
 SYSTEM_PROMPT = (
     "You are LangSearch, a helpful assistant that can search Wikipedia and "
     "ArXiv. Use the tools when you need facts or research papers, then answer "
-    "clearly and concisely. If a tool fails, say so and answer with what you know."
+    "clearly and concisely. Only call the tools search_wikipedia and search_arxiv, "
+    "using exactly those names, and never call any other tool. If a tool fails, "
+    "say so and answer with what you know."
 )
+
+# Used when the model's tool calling keeps failing: we fetch sources ourselves
+# and ask for a plain answer (no mention of tools, so the model has no reason to call one).
+FALLBACK_SYSTEM = (
+    "You are LangSearch, a helpful assistant. Answer the user's question clearly and "
+    "concisely. Reference material retrieved from Wikipedia and ArXiv is provided below; "
+    "use it when relevant and mention where the information comes from. If it is empty or "
+    "irrelevant, answer from your own knowledge and say that no sources could be retrieved.\n\n"
+    "Reference material:\n{context}"
+)
+
+RESEARCH_HINTS = ("paper", "research", "arxiv", "study", "studies", "preprint", "literature", "survey")
+_FILLER = {"search", "find", "show", "give", "me", "please", "what", "is", "are", "explain", "tell",
+           "about", "on", "for", "of", "the", "a", "an", "research", "papers", "paper", "arxiv",
+           "wikipedia", "latest", "recent", "related", "to", "in", "from", "and"}
 
 
 # ---------------- Tools ----------------
@@ -84,17 +103,17 @@ def arxiv_search(query: str) -> str:
         return f"ArXiv is unavailable right now (possibly rate-limited): {type(e).__name__}"
 
 
-TOOL_FUNCS = {"wikipedia": wikipedia_search, "arxiv": arxiv_search}
+TOOL_FUNCS = {"search_wikipedia": wikipedia_search, "search_arxiv": arxiv_search}
 
 TOOLS = [
     {"type": "function", "function": {
-        "name": "wikipedia",
+        "name": "search_wikipedia",
         "description": "Search Wikipedia for general knowledge and definitions.",
         "parameters": {"type": "object",
                        "properties": {"query": {"type": "string"}},
                        "required": ["query"]}}},
     {"type": "function", "function": {
-        "name": "arxiv",
+        "name": "search_arxiv",
         "description": "Search ArXiv.org for scientific papers.",
         "parameters": {"type": "object",
                        "properties": {"query": {"type": "string"}},
@@ -107,11 +126,12 @@ TOOLS = [
 class GroqError(Exception):
     """Upstream (Groq) failure. `detail` is for server logs only."""
 
-    def __init__(self, status, detail, code=None):
+    def __init__(self, status, detail, code=None, generation=None):
         super().__init__(detail)
         self.status = status
         self.detail = detail
         self.code = code
+        self.generation = generation
 
 
 def groq_chat(api_key, model, messages, use_tools, timeout):
@@ -131,14 +151,17 @@ def groq_chat(api_key, model, messages, use_tools, timeout):
         raise GroqError(502, f"Could not reach Groq: {type(e).__name__}")
 
     if r.status_code != 200:
-        detail, code = r.text[:500], None
+        detail, code, generation = r.text[:500], None, None
         try:
             err = r.json().get("error", {})
             detail = err.get("message", detail)
             code = err.get("code")
+            generation = err.get("failed_generation")
         except Exception:
             pass
-        raise GroqError(r.status_code, str(detail).replace(api_key, "[redacted]"), code)
+        if generation is not None:
+            generation = str(generation)[:300].replace(api_key, "[redacted]")
+        raise GroqError(r.status_code, str(detail).replace(api_key, "[redacted]"), code, generation)
 
     try:
         message = r.json()["choices"][0]["message"]
@@ -155,11 +178,41 @@ def public_message(err: GroqError):
         return "The AI service rejected this server's credentials. The site owner needs to check the API key.", 502
     if err.status == 404:
         return "The AI model is currently unavailable. The site owner needs to update the model setting.", 502
+    if err.code == "tool_use_failed":
+        return "The AI had trouble processing that request. Please rephrase it and try again.", 502
     if err.status == 429:
         return "Too many requests right now. Please wait a moment and try again.", 429
     if err.status == 504:
         return "The AI service took too long to respond. Please try again.", 504
     return "The AI service is temporarily unavailable. Please try again shortly.", 502
+
+
+def _is_tool_failure(err):
+    return err.status == 400 and err.code == "tool_use_failed"
+
+
+def _topic(text):
+    words = re.findall(r"[A-Za-z0-9][\w\-+.#]*", text)
+    kept = [w for w in words if w.lower() not in _FILLER]
+    return " ".join(kept)[:200] or text[:200]
+
+
+def fallback_answer(api_key, model, history, deadline):
+    """Retrieve sources ourselves, then ask the model for a plain answer without tools."""
+    question = history[-1]["content"]
+    topic = _topic(question)
+    parts = ["Wikipedia: " + wikipedia_search(topic)]
+    if any(h in question.lower() for h in RESEARCH_HINTS):
+        parts.append("ArXiv: " + arxiv_search(topic))
+    messages = [{"role": "system", "content": FALLBACK_SYSTEM.format(context="\n\n".join(parts))}] + history
+    remaining = deadline - time.monotonic()
+    if remaining < 5:
+        raise GroqError(504, "Time budget exhausted before fallback answer")
+    msg = groq_chat(api_key, model, messages, use_tools=False, timeout=min(30, remaining))
+    reply = (msg.get("content") or "").strip()
+    if not reply:
+        raise GroqError(502, "Model returned an empty fallback answer")
+    return reply
 
 
 # ---------------- Routes ----------------
@@ -203,21 +256,25 @@ def chat():
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history
     deadline = time.monotonic() + TIME_BUDGET_SECONDS
-    tools_enabled, tool_rounds = True, 0
+    tool_rounds, tool_failures = 0, 0
 
     try:
-        for _ in range(MAX_TOOL_ROUNDS + 2):
+        for _ in range(MAX_TOOL_ROUNDS + MAX_TOOL_RETRIES + 1):
             remaining = deadline - time.monotonic()
             if remaining < 5:
                 raise GroqError(504, "Time budget exhausted")
 
-            use_tools = tools_enabled and tool_rounds < MAX_TOOL_ROUNDS
+            use_tools = tool_rounds < MAX_TOOL_ROUNDS
             try:
                 msg = groq_chat(api_key, model, messages, use_tools, timeout=min(30, remaining))
             except GroqError as e:
-                if e.status == 400 and e.code == "tool_use_failed" and tools_enabled:
-                    log.warning("Model produced an invalid tool call; retrying without tools")
-                    tools_enabled = False
+                if _is_tool_failure(e) and use_tools:
+                    tool_failures += 1
+                    log.warning("Invalid tool call (%d/%d) model=%s detail=%s generation=%s",
+                                tool_failures, MAX_TOOL_RETRIES + 1, model, e.detail, e.generation)
+                    if tool_failures > MAX_TOOL_RETRIES:
+                        log.warning("Tool calling keeps failing; answering from retrieved sources instead")
+                        return jsonify(reply=fallback_answer(api_key, model, history, deadline))
                     continue
                 raise
 
@@ -234,6 +291,8 @@ def chat():
             for c in calls:
                 fn_info = c.get("function") or {}
                 name = str(fn_info.get("name", "")).split(".")[-1]
+                if name in ("wikipedia", "arxiv"):  # tolerate the old short names
+                    name = "search_" + name
                 try:
                     args = json.loads(fn_info.get("arguments") or "{}")
                 except (json.JSONDecodeError, TypeError):
@@ -246,7 +305,8 @@ def chat():
         raise GroqError(502, "No final answer after tool rounds")
 
     except GroqError as e:
-        log.error("Groq failure: status=%s code=%s model=%s detail=%s", e.status, e.code, model, e.detail)
+        log.error("Groq failure: status=%s code=%s model=%s detail=%s generation=%s",
+                  e.status, e.code, model, e.detail, e.generation)
         text, status = public_message(e)
         return jsonify(error=text), status
 
