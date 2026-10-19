@@ -9,7 +9,7 @@ Ask questions naturally and receive accurate, AI-generated answers with real-tim
 ## 🌐 Live Demo
 
 ```bash
-https://your-project-name.vercel.app
+https://langsearch-chatbot-codertheashish.vercel.app/
 ```
 
 ---
