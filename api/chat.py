@@ -24,7 +24,7 @@ HEADERS = {"User-Agent": "LangSearchChatbot/1.0 (vercel deployment)"}
 
 MAX_HISTORY = 12            # messages kept from the browser
 MAX_MESSAGE_CHARS = 4000    # per message
-MAX_TOOL_ROUNDS = 4         # Wikipedia/ArXiv rounds before forcing an answer
+MAX_TOOL_ROUNDS = 3         # Wikipedia/ArXiv rounds before answering from what was found
 MAX_TOOL_RETRIES = 2        # retries when the model emits a broken tool call
 TIME_BUDGET_SECONDS = 50    # must stay below maxDuration (60s) in vercel.json
 
@@ -197,22 +197,43 @@ def _topic(text):
     return " ".join(kept)[:200] or text[:200]
 
 
-def fallback_answer(api_key, model, history, deadline):
-    """Retrieve sources ourselves, then ask the model for a plain answer without tools."""
-    question = history[-1]["content"]
-    topic = _topic(question)
-    parts = ["Wikipedia: " + wikipedia_search(topic)]
-    if any(h in question.lower() for h in RESEARCH_HINTS):
-        parts.append("ArXiv: " + arxiv_search(topic))
-    messages = [{"role": "system", "content": FALLBACK_SYSTEM.format(context="\n\n".join(parts))}] + history
+def _has_real_results(sources):
+    bad = ("No Wikipedia results", "No ArXiv papers", "search failed", "unavailable right now", "Unknown tool")
+    return any(src.strip() and not any(b in src for b in bad) for src in sources)
+
+
+def answer_from_sources(api_key, model, history, deadline, sources):
+    """Final answer step. Uses a clean prompt (no tool-call history) so gpt-oss has no
+    pattern to continue with another tool call. If no sources were collected yet, fetch
+    them here. If the model still misbehaves, return the raw results instead of an error."""
+    if not sources:
+        question = history[-1]["content"]
+        topic = _topic(question)
+        sources = ["Wikipedia: " + wikipedia_search(topic)]
+        if any(h in question.lower() for h in RESEARCH_HINTS):
+            sources.append("ArXiv: " + arxiv_search(topic))
+
+    context = "\n\n".join(sources)
+    messages = [{"role": "system", "content": FALLBACK_SYSTEM.format(context=context)}] + history
     remaining = deadline - time.monotonic()
     if remaining < 5:
-        raise GroqError(504, "Time budget exhausted before fallback answer")
-    msg = groq_chat(api_key, model, messages, use_tools=False, timeout=min(30, remaining))
-    reply = (msg.get("content") or "").strip()
-    if not reply:
-        raise GroqError(502, "Model returned an empty fallback answer")
-    return reply
+        raise GroqError(504, "Time budget exhausted before final answer")
+    original = None
+    try:
+        msg = groq_chat(api_key, model, messages, use_tools=False, timeout=min(30, remaining))
+        reply = (msg.get("content") or "").strip()
+        if reply:
+            return reply
+        log.warning("Model returned an empty final answer")
+    except GroqError as e:
+        if not _is_tool_failure(e):
+            raise
+        original = e
+        log.warning("Final answer step failed (model=%s detail=%s generation=%s)", model, e.detail, e.generation)
+
+    if _has_real_results(sources):
+        return ("I couldn't generate a summary just now, but here is what I found:\n\n" + context)[:4000]
+    raise original or GroqError(502, "No usable answer and no sources", "tool_use_failed")
 
 
 # ---------------- Routes ----------------
@@ -257,6 +278,7 @@ def chat():
     messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history
     deadline = time.monotonic() + TIME_BUDGET_SECONDS
     tool_rounds, tool_failures = 0, 0
+    sources, seen = [], set()
 
     try:
         for _ in range(MAX_TOOL_ROUNDS + MAX_TOOL_RETRIES + 1):
@@ -264,7 +286,11 @@ def chat():
             if remaining < 5:
                 raise GroqError(504, "Time budget exhausted")
 
-            use_tools = tool_rounds < MAX_TOOL_ROUNDS
+            if tool_rounds >= MAX_TOOL_ROUNDS:
+                log.info("Tool rounds used up; answering from %d collected source(s)", len(sources))
+                return jsonify(reply=answer_from_sources(api_key, model, history, deadline, sources))
+
+            use_tools = True
             try:
                 msg = groq_chat(api_key, model, messages, use_tools, timeout=min(30, remaining))
             except GroqError as e:
@@ -274,7 +300,7 @@ def chat():
                                 tool_failures, MAX_TOOL_RETRIES + 1, model, e.detail, e.generation)
                     if tool_failures > MAX_TOOL_RETRIES:
                         log.warning("Tool calling keeps failing; answering from retrieved sources instead")
-                        return jsonify(reply=fallback_answer(api_key, model, history, deadline))
+                        return jsonify(reply=answer_from_sources(api_key, model, history, deadline, sources))
                     continue
                 raise
 
@@ -299,10 +325,18 @@ def chat():
                     args = {}
                 query = str(args.get("query", ""))[:300] if isinstance(args, dict) else ""
                 fn = TOOL_FUNCS.get(name)
-                result = fn(query) if fn and query else "Unknown tool or empty query."
+                if (name, query.lower()) in seen:
+                    result = "You already searched for this. Use the earlier result and answer now."
+                elif fn and query:
+                    seen.add((name, query.lower()))
+                    log.info("Tool call: %s query=%r", name, query)
+                    result = fn(query)
+                    sources.append(f"{name.replace('search_', '').title()} results for '{query}':\n{result}")
+                else:
+                    result = "Unknown tool or empty query."
                 messages.append({"role": "tool", "tool_call_id": c.get("id", ""), "content": result})
 
-        raise GroqError(502, "No final answer after tool rounds")
+        return jsonify(reply=answer_from_sources(api_key, model, history, deadline, sources))
 
     except GroqError as e:
         log.error("Groq failure: status=%s code=%s model=%s detail=%s generation=%s",
